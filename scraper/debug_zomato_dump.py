@@ -119,27 +119,29 @@ async def main():
 
         if not sr:
             pathlib.Path("zomato_full_response.json").write_text(
-                json.dumps(data, indent=2, ensure_ascii=False)
+                json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8"
             )
-            print("No results — full response saved to zomato_full_response.json")
+            print("No results - full response saved to zomato_full_response.json")
             return
 
-        # Dump raw item[0] to see every key
+        # Dump raw item[0] — use ensure_ascii=True to avoid cp1252 issues on Windows
         item = sr[0]
         info = item.get("info") or item
 
         pathlib.Path("zomato_info_sample.json").write_text(
-            json.dumps(info, indent=2, ensure_ascii=False)
+            json.dumps(info, indent=2, ensure_ascii=True), encoding="utf-8"
         )
         print("\n=== zomato_info_sample.json written ===")
         print(f"Top-level keys: {list(info.keys())}")
 
         # Print any key that looks like eta/price/cost/delivery/time
-        keywords = ("eta", "price", "cost", "delivery", "time", "ETA")
+        keywords = ("eta", "price", "cost", "delivery", "time")
         print("\n--- Relevant keys (name + value) ---")
         for k, v in info.items():
             if any(kw.lower() in k.lower() for kw in keywords):
-                print(f"  {k!r}: {json.dumps(v)[:120]}")
+                # encode to ascii for safe Windows console output
+                safe_v = json.dumps(v, ensure_ascii=True)[:120]
+                print(f"  {k!r}: {safe_v}")
 
         # Also check one level deep
         print("\n--- Nested relevant keys ---")
@@ -147,7 +149,8 @@ async def main():
             if isinstance(v, dict):
                 for kk, vv in v.items():
                     if any(kw.lower() in kk.lower() for kw in keywords):
-                        print(f"  info[{k!r}][{kk!r}]: {json.dumps(vv)[:120]}")
+                        safe_v = json.dumps(vv, ensure_ascii=True)[:120]
+                        print(f"  info[{k!r}][{kk!r}]: {safe_v}")
 
 
 asyncio.run(main())
