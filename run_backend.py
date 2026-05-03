@@ -8,10 +8,11 @@ if sys.platform == "win32":
 import uvicorn
 
 if __name__ == "__main__":
+    is_windows = sys.platform == "win32"
     uvicorn.run(
         "backend.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=not is_windows,
         loop="asyncio",
     )
