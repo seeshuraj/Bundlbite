@@ -1,7 +1,19 @@
 # scraper/main.py
 import os
+import sys
 import json
+import asyncio
 import traceback
+
+# -------------------------------------------------------
+# WINDOWS FIX: Playwright uses asyncio.create_subprocess_exec
+# which requires SelectorEventLoop on Windows.
+# ProactorEventLoop (Windows default) raises NotImplementedError.
+# This MUST be set before FastAPI/uvicorn starts the loop.
+# -------------------------------------------------------
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -30,7 +42,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "platform": sys.platform}
 
 
 @app.get("/swiggy/restaurants")
@@ -56,11 +68,10 @@ async def swiggy_restaurants(
             "error": "" if restaurants else "No results — Swiggy may be blocking scraper",
         }
     except Exception as e:
-        # Return detailed error instead of 500
         tb = traceback.format_exc()
         print(f"[Scraper ERROR]\n{tb}")
         return JSONResponse(
-            status_code=200,  # Return 200 with error details so UI can handle gracefully
+            status_code=200,
             content={
                 "provider": "swiggy",
                 "restaurants": [],
