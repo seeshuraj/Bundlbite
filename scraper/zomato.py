@@ -4,6 +4,7 @@
 # Integrates with main.py via fetch_zomato_restaurants / fetch_zomato_menu.
 
 import json
+import re
 import httpx
 
 BROWSER_UA = (
@@ -97,30 +98,25 @@ def _make_filters(prev_search: str, postback: str) -> str:
 
 def _extract_delivery_time(info: dict) -> str:
     """
-    Probe every known Zomato response shape for delivery ETA.
-    Shapes seen in the wild:
-      - info.etaRange            = {"minTime": 25, "maxTime": 40, "unit": "min"}
-      - info.eta                 = 35  (plain int minutes)
-      - info.orderDeliveryInfo.etaRange
-      - info.orderDeliveryInfo.eta
-      - info.deliveryInfo.etaRange
-      - info.deliveryMeta.etaRange
-      - info.delivery.deliveryTime
-      - info.deliveryTime        = "35 min"
+    Probe all known Zomato shapes for delivery ETA.
+    NOTE: webroutes/search/home does NOT return ETA in listing responses.
+    ETA is only available on the individual restaurant page.
+    Returns empty string if not present — handled gracefully by the frontend.
     """
-    # 1. top-level etaRange dict
+    # etaRange dict: {"minTime": 25, "maxTime": 40}
     eta_raw = info.get("etaRange")
     if isinstance(eta_raw, dict):
         t = eta_raw.get("minTime") or eta_raw.get("maxTime")
         if t is not None:
             return str(t)
 
-    # 2. top-level eta plain value
-    eta_raw = info.get("eta")
-    if eta_raw is not None and str(eta_raw).strip():
-        return str(eta_raw)
+    # plain int/str
+    for field in ("eta", "deliveryTime", "delivery_time", "eta_text"):
+        val = info.get(field)
+        if val is not None and str(val).strip():
+            return str(val)
 
-    # 3. nested under orderDeliveryInfo
+    # nested under orderDeliveryInfo / deliveryInfo / deliveryMeta / delivery
     for key in ("orderDeliveryInfo", "deliveryInfo", "deliveryMeta", "delivery"):
         sub = info.get(key)
         if not isinstance(sub, dict):
@@ -135,44 +131,62 @@ def _extract_delivery_time(info: dict) -> str:
             if val is not None and str(val).strip():
                 return str(val)
 
-    # 4. flat fallback fields
-    for field in ("deliveryTime", "delivery_time", "eta_text"):
-        val = info.get(field)
-        if val is not None and str(val).strip():
-            return str(val)
-
     return ""
 
 
 def _extract_price(info: dict) -> str:
     """
-    Probe every known Zomato response shape for cost-for-two.
-    Shapes seen in the wild:
-      - info.price                  = 400   (rupees, plain int)
-      - info.average_cost_for_two   = 400
-      - info.costForTwo             = 400
-      - info.priceRange             = "₹300 - ₹600"  or  300
-      - info.priceBracket           = "₹₹"
-      - info.orderDeliveryInfo.costForTwo
+    Probe all known Zomato shapes for price.
+
+    Confirmed live shape (webroutes/search/home listing response):
+      info.costText = {"text": "\u20b9200 for one"}
+
+    Also handles older shapes:
+      info.cft / info.cfo = {"text": "\u20b9400 for two"}
+      info.price / info.average_cost_for_two / info.costForTwo = 400 (int)
     """
-    # Try plain numeric fields first
+    # 1. costText.text — CONFIRMED live key e.g. "\u20b9200 for one"
+    cost_text = info.get("costText")
+    if isinstance(cost_text, dict):
+        text = cost_text.get("text", "")
+        if text:
+            # Normalise "X for one" -> "X for two" by doubling the amount
+            m = re.search(r"[\u20b9Rs\.]*\s*(\d+)\s*for\s*one", text, re.IGNORECASE)
+            if m:
+                return f"\u20b9{int(m.group(1)) * 2} for two"
+            # Already "for two" or other format — return as-is
+            return text
+
+    # 2. cft (cost for two) or cfo (cost for one) objects
+    for key in ("cft", "cfo"):
+        obj = info.get(key)
+        if isinstance(obj, dict):
+            text = obj.get("text", "")
+            if text:
+                if key == "cfo":
+                    m = re.search(r"(\d+)", text)
+                    if m:
+                        return f"\u20b9{int(m.group(1)) * 2} for two"
+                return text
+
+    # 3. Plain numeric fields
     for field in ("price", "average_cost_for_two", "costForTwo", "cost_for_two"):
         val = info.get(field)
         if val is not None and str(val).strip() not in ("", "0", "None"):
             try:
-                return f"₹{int(val)} for two"
+                return f"\u20b9{int(val)} for two"
             except (ValueError, TypeError):
                 return str(val)
 
-    # priceRange may be a string like "₹300 - ₹600" or a plain int
+    # 4. priceRange string or int
     pr = info.get("priceRange")
     if pr is not None and str(pr).strip() not in ("", "0", "None"):
         try:
-            return f"₹{int(pr)} for two"
+            return f"\u20b9{int(pr)} for two"
         except (ValueError, TypeError):
             return str(pr)
 
-    # Nested under orderDeliveryInfo / deliveryInfo
+    # 5. Nested under orderDeliveryInfo / deliveryInfo
     for key in ("orderDeliveryInfo", "deliveryInfo"):
         sub = info.get(key)
         if not isinstance(sub, dict):
@@ -181,7 +195,7 @@ def _extract_price(info: dict) -> str:
             val = sub.get(field)
             if val is not None and str(val).strip() not in ("", "0"):
                 try:
-                    return f"₹{int(val)} for two"
+                    return f"\u20b9{int(val)} for two"
                 except (ValueError, TypeError):
                     return str(val)
 
@@ -213,7 +227,7 @@ def _parse_restaurant(item: dict) -> dict | None:
     else:
         cuisine = str(cuisine_raw)
 
-    # ── Delivery time & Price (extracted via helpers above) ─────────
+    # ── Delivery time & Price ───────────────────────────────────
     delivery_time = _extract_delivery_time(info)
     price_for_two = _extract_price(info)
 
@@ -299,7 +313,8 @@ async def fetch_zomato_restaurants(
         search_id = None
 
         page = 1
-        while len(restaurants) < max_results:
+ hitting_limit = False
+        while len(restaurants) < max_results and not hitting_limit:
             if search_id:
                 pb = json.loads(postback)
                 pb["search_id"] = search_id
@@ -343,20 +358,16 @@ async def fetch_zomato_restaurants(
             if meta.get("previousSearchParams"):
                 prev_search = meta["previousSearchParams"]
 
-            new_count = 0
             for item in (sr if isinstance(sr, list) else []):
                 parsed = _parse_restaurant(item)
                 if parsed and parsed["id"] not in seen_ids:
                     seen_ids.add(parsed["id"])
                     if _is_relevant(parsed, keyword):
                         restaurants.append(parsed)
-                        new_count += 1
 
             has_more = meta.get("hasMore", False)
-            if not has_more:
-                break
-            if page >= 8:
-                break
+            if not has_more or page >= 8:
+                hitting_limit = True
 
             page += 1
 
