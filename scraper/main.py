@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
     print("[Scraper] Shutting down")
 
 
-app = FastAPI(title="Bundlbite Scraper", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Bundlbite Scraper", version="1.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,11 +59,27 @@ def _err(provider: str, e: Exception, tb: str) -> JSONResponse:
     })
 
 
+def _dedup_by_name(restaurants: list) -> list:
+    """
+    Remove cross-provider duplicates by normalising restaurant names.
+    e.g. "McDonald's" appearing from both Swiggy and Zomato -> keep first only.
+    """
+    seen_names: set[str] = set()
+    unique = []
+    for r in restaurants:
+        # Normalise: lowercase, strip spaces and punctuation for matching
+        key = "".join(ch for ch in r.get("name", "").lower() if ch.isalnum())
+        if key not in seen_names:
+            seen_names.add(key)
+            unique.append(r)
+    return unique
+
+
 # ── health ────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "platform": sys.platform, "version": "1.1.0"}
+    return {"status": "ok", "platform": sys.platform, "version": "1.2.0"}
 
 
 # ── swiggy ────────────────────────────────────────────────────────────
@@ -155,7 +171,10 @@ async def compare(
 ):
     """
     Fetch from both Swiggy and Zomato concurrently.
-    Returns merged list tagged with source, plus per-provider counts.
+    Returns merged + deduplicated list tagged with source.
+    When a keyword is supplied, both scrapers filter by it before merging.
+    Cross-provider duplicates (same restaurant name on both platforms) are
+    collapsed, keeping the Swiggy entry first (has delivery_time + price).
     """
     swiggy_task = fetch_swiggy_restaurants(lat, lng, keyword)
     zomato_task = fetch_zomato_restaurants(lat, lng, keyword)
@@ -164,7 +183,6 @@ async def compare(
         swiggy_task, zomato_task, return_exceptions=True
     )
 
-    # Handle exceptions gracefully
     if isinstance(swiggy_results, Exception):
         print(f"[Compare] Swiggy error: {swiggy_results}")
         swiggy_results = []
@@ -172,7 +190,8 @@ async def compare(
         print(f"[Compare] Zomato error: {zomato_results}")
         zomato_results = []
 
-    merged = swiggy_results + zomato_results
+    # Swiggy first so its richer data (delivery_time, price) wins on dedup
+    merged = _dedup_by_name(swiggy_results + zomato_results)
 
     return {
         "keyword": keyword,

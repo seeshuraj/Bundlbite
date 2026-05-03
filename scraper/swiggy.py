@@ -1,5 +1,6 @@
 # scraper/swiggy.py
 # Swiggy scraper using httpx - direct API, no Playwright needed
+# v2: adds search/v3 endpoint for keyword queries (returns more relevant results)
 
 import httpx
 from typing import Optional
@@ -29,10 +30,18 @@ def _parse_restaurant(info: dict) -> Optional[dict]:
     name = info.get("name")
     if not name:
         return None
+
+    # Cuisines can be a list or a comma-separated string depending on endpoint
+    raw_cuisines = info.get("cuisines", [])
+    if isinstance(raw_cuisines, str):
+        cuisines = [c.strip() for c in raw_cuisines.split(",")]
+    else:
+        cuisines = raw_cuisines
+
     return {
         "id": str(info.get("id", "")),
         "name": name,
-        "cuisines": info.get("cuisines", []),
+        "cuisines": cuisines,
         "rating": str(
             info.get("avgRatingString")
             or info.get("avgRating")
@@ -66,63 +75,148 @@ def _extract_from_cards(cards: list) -> list:
     return results
 
 
+def _extract_from_search_cards(cards: list) -> list:
+    """
+    Swiggy search/v3 response structure:
+    cards[].groupedCard.cardGroupMap.RESTAURANT.cards[].card.card
+      -> {"@type": "...", "info": {...}}
+    Also handles flat card.card.info structure.
+    """
+    results = []
+    for card in cards:
+        # Path 1: groupedCard (search endpoint)
+        grouped = card.get("groupedCard", {})
+        for group_key, group_val in grouped.get("cardGroupMap", {}).items():
+            for inner_card in group_val.get("cards", []):
+                info = (
+                    inner_card.get("card", {}).get("card", {}).get("info")
+                    or inner_card.get("card", {}).get("info")
+                )
+                if info and info.get("name"):
+                    parsed = _parse_restaurant(info)
+                    if parsed:
+                        results.append(parsed)
+        # Path 2: direct card.card.info (listing endpoint)
+        direct_info = card.get("card", {}).get("card", {}).get("info")
+        if direct_info and direct_info.get("name"):
+            parsed = _parse_restaurant(direct_info)
+            if parsed:
+                results.append(parsed)
+    return results
+
+
+def _dedup(restaurants: list) -> list:
+    seen, unique = set(), []
+    for r in restaurants:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            unique.append(r)
+    return unique
+
+
+async def _fetch_swiggy_search(client: httpx.AsyncClient, lat: float, lng: float, keyword: str) -> list:
+    """
+    Use Swiggy's search/v3 endpoint for keyword-based restaurant queries.
+    Returns more relevant results than the listing endpoint for specific cuisines.
+    """
+    url = (
+        f"{SWIGGY_API}/restaurants/search/v3"
+        f"?lat={lat}&lng={lng}"
+        f"&str={keyword}"
+        f"&trackingId=undefined"
+        f"&submitAction=ENTER"
+        f"&queryUniqueId="
+        f"&selectedPLTab=RESTAURANT"
+    )
+    try:
+        r = await client.get(url, timeout=20)
+        print(f"[Swiggy Search] Status: {r.status_code} for keyword='{keyword}'")
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if data.get("statusCode", -1) != 0:
+            print(f"[Swiggy Search] API statusCode: {data.get('statusCode')}")
+            return []
+        cards = data.get("data", {}).get("cards", [])
+        results = _extract_from_search_cards(cards)
+        # Also try the top-level restaurants list some API versions return
+        for card in cards:
+            restaurants_list = (
+                card.get("card", {}).get("card", {})
+                    .get("gridElements", {}).get("infoWithStyle", {})
+                    .get("restaurants", [])
+            )
+            for rr in restaurants_list:
+                parsed = _parse_restaurant(rr.get("info", {}))
+                if parsed:
+                    results.append(parsed)
+        results = _dedup(results)
+        print(f"[Swiggy Search] Extracted {len(results)} restaurants")
+        return results
+    except Exception as e:
+        print(f"[Swiggy Search] Exception: {e}")
+        return []
+
+
 async def fetch_swiggy_restaurants(
     lat: float, lng: float, keyword: str = ""
 ) -> list:
-    url = (
-        f"{SWIGGY_API}/restaurants/list/v5"
-        f"?lat={lat}&lng={lng}"
-        f"&is-seo-homepage-enabled=true"
-        f"&page_type=DESKTOP_WEB_LISTING"
-    )
-
     async with httpx.AsyncClient(
         headers=BASE_HEADERS,
         follow_redirects=True,
         timeout=30,
     ) as client:
-        # Warm up session
+        # Warm up session cookie
         try:
             await client.get("https://www.swiggy.com", timeout=10)
         except Exception:
             pass
 
-        r = await client.get(url)
-        print(f"[Swiggy] Status: {r.status_code}")
+        results = []
 
-        if r.status_code != 200:
-            print(f"[Swiggy] Error body: {r.text[:200]}")
-            return []
+        # ── Strategy 1: search/v3 when keyword is provided ──────────────
+        if keyword:
+            results = await _fetch_swiggy_search(client, lat, lng, keyword)
 
-        data = r.json()
-        if data.get("statusCode", -1) != 0:
-            print(f"[Swiggy] API statusCode: {data.get('statusCode')}")
-            return []
+        # ── Strategy 2: listing endpoint (always runs as fallback/supplement) ──
+        list_url = (
+            f"{SWIGGY_API}/restaurants/list/v5"
+            f"?lat={lat}&lng={lng}"
+            f"&is-seo-homepage-enabled=true"
+            f"&page_type=DESKTOP_WEB_LISTING"
+        )
+        try:
+            r = await client.get(list_url)
+            print(f"[Swiggy List] Status: {r.status_code}")
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("statusCode", -1) == 0:
+                    cards = data.get("data", {}).get("cards", [])
+                    list_results = _extract_from_cards(cards)
+                    print(f"[Swiggy List] Extracted {len(list_results)} restaurants")
+                    # Merge: add list results not already in search results
+                    results = results + list_results
+        except Exception as e:
+            print(f"[Swiggy List] Exception: {e}")
 
-        cards = data.get("data", {}).get("cards", [])
-        restaurants = _extract_from_cards(cards)
-        print(f"[Swiggy] Extracted {len(restaurants)} restaurants")
+        # ── Deduplicate merged set ───────────────────────────────────────
+        results = _dedup(results)
 
-        # Keyword filter
-        if keyword and restaurants:
+        # ── Keyword filter on merged set ────────────────────────────────
+        if keyword and results:
             kw = keyword.lower()
             filtered = [
-                r for r in restaurants
+                r for r in results
                 if kw in r["name"].lower()
                 or any(kw in c.lower() for c in r.get("cuisines", []))
             ]
-            restaurants = filtered if filtered else restaurants
-            print(f"[Swiggy] After keyword filter '{keyword}': {len(restaurants)}")
+            # Only apply filter if it returns results; otherwise keep all
+            if filtered:
+                results = filtered
+            print(f"[Swiggy] After keyword filter '{keyword}': {len(results)}")
 
-        # Deduplicate
-        seen, unique = set(), []
-        for r in restaurants:
-            if r["id"] not in seen:
-                seen.add(r["id"])
-                unique.append(r)
-
-        print(f"[Swiggy] Final: {len(unique)} unique restaurants")
-        return unique
+        print(f"[Swiggy] Final: {len(results)} unique restaurants")
+        return results
 
 
 async def fetch_swiggy_menu(

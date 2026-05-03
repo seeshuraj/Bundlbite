@@ -13,11 +13,6 @@ BROWSER_UA = (
 )
 
 # Default location blob for Bangalore city-level delivery listing.
-# placeId / cellId / deliverySubzoneId are required by Zomato’s backend
-# to resolve which delivery zone to use. These values are for the
-# Koramangala/UB City DSZ and work for most Bangalore queries.
-# For user-specific lat/lng, wire in a /webroutes/search/autoSuggest
-# lookup to get the correct placeId for that coordinate.
 _BANGALORE_LOC = {
     "latitude":               "12.9716060000000000",
     "longitude":              "77.5943760000000000",
@@ -78,7 +73,6 @@ def _api_headers(csrf: str) -> dict:
 
 
 def _make_filters(prev_search: str, postback: str) -> str:
-    """Build the JSON-stringified filters string Zomato expects."""
     return json.dumps({
         "searchMetadata": {
             "previousSearchParams": prev_search,
@@ -102,51 +96,85 @@ def _make_filters(prev_search: str, postback: str) -> str:
 
 
 def _parse_restaurant(item: dict) -> dict | None:
+    # Zomato wraps the real data under 'info' in SECTION_SEARCH_RESULT
     info = item.get("info") or item
     name = info.get("name", "")
     if not name:
         return None
 
-    # Rating
+    # ── Rating ──────────────────────────────────────────────────────
     r = info.get("rating", {})
     rating = str(r.get("aggregate_rating") or r.get("rating", ""))
 
-    # Cuisine
+    # ── Cuisine ─────────────────────────────────────────────────────
+    # Zomato returns cuisine as a list of objects with 'deeplink_text' or 'name'
     cuisine = ", ".join(
         c.get("deeplink_text", c.get("name", ""))
         for c in info.get("cuisine", [])
     )
 
-    # Delivery time — Zomato returns this as 'eta' (e.g. "29 mins")
-    delivery_time = str(
-        info.get("eta")
+    # ── Delivery time ───────────────────────────────────────────────
+    # Zomato returns ETA in multiple possible keys
+    eta_raw = (
+        info.get("etaRange")              # e.g. {"maxTime": 40, "minTime": 25, ...}
+        or info.get("eta")                # plain int or string
         or info.get("delivery_time")
         or info.get("deliveryTime")
         or ""
     )
+    if isinstance(eta_raw, dict):
+        # etaRange: pick maxTime for a conservative display
+        delivery_time = str(eta_raw.get("minTime", eta_raw.get("maxTime", "")))
+    else:
+        delivery_time = str(eta_raw)
 
-    # Price for two
-    price = str(info.get("price", info.get("average_cost_for_two", "")))
+    # ── Price for two ───────────────────────────────────────────────
+    # 'price' is cost-for-two in rupees; fall back to 'average_cost_for_two'
+    price_raw = info.get("price") or info.get("average_cost_for_two") or ""
+    if price_raw:
+        price_for_two = f"\u20b9{price_raw} for two"
+    else:
+        price_for_two = ""
 
-    # Image — prefer o2FeaturedImage, fallback to image
-    img = info.get("o2FeaturedImage") or info.get("image") or {}
-    image_url = img.get("url", img.get("imageUrl", ""))
+    # ── Image ───────────────────────────────────────────────────────
+    # Zomato: 'featuredImage' object with 'url', or plain string 'image'
+    img = info.get("featuredImage") or info.get("o2FeaturedImage") or info.get("image") or {}
+    if isinstance(img, dict):
+        image_url = img.get("url", img.get("imageUrl", ""))
+    else:
+        image_url = str(img)  # already a URL string in some response shapes
 
-    # Deep-link URL
-    slug = (info.get("actionInfo") or {}).get("clickUrl", "")
-    url = f"https://www.zomato.com{slug}" if slug else ""
+    # ── Deep-link URL ───────────────────────────────────────────────
+    action = info.get("actionInfo") or info.get("action") or {}
+    slug = action.get("clickUrl") or action.get("deeplink") or ""
+    if slug and slug.startswith("/"):
+        url = f"https://www.zomato.com{slug}"
+    elif slug and slug.startswith("http"):
+        url = slug
+    else:
+        url = ""
 
     return {
-        "id":            str(info.get("resId", "")),
+        "id":            str(info.get("resId", info.get("id", ""))),
         "name":          name,
         "rating":        rating,
         "cuisine":       cuisine,
         "delivery_time": delivery_time,
-        "price_for_two": price,
+        "price_for_two": price_for_two,
         "image":         image_url,
         "url":           url,
         "source":        "zomato",
     }
+
+
+def _is_relevant(restaurant: dict, keyword: str) -> bool:
+    """Return True if the restaurant matches the keyword in name or cuisine."""
+    if not keyword:
+        return True
+    kw = keyword.lower()
+    name = restaurant.get("name", "").lower()
+    cuisine = restaurant.get("cuisine", "").lower()
+    return kw in name or kw in cuisine
 
 
 async def fetch_zomato_restaurants(
@@ -159,6 +187,8 @@ async def fetch_zomato_restaurants(
     Fetch restaurant listings from Zomato delivery.
     lat/lng are accepted for API compatibility but Zomato resolves
     location via the DSZ place fields in the payload.
+    When a keyword is supplied, results are filtered to matching
+    names/cuisines so the /compare endpoint returns relevant data.
     """
     restaurants: list[dict] = []
     seen_ids: set[str] = set()
@@ -176,7 +206,6 @@ async def fetch_zomato_restaurants(
 
         h = _api_headers(csrf)
 
-        # Initial pagination state
         prev_search = json.dumps({
             "PreviousSearchFilter": [
                 json.dumps({"category_context": "delivery_home"}),
@@ -234,30 +263,34 @@ async def fetch_zomato_restaurants(
             if meta.get("previousSearchParams"):
                 prev_search = meta["previousSearchParams"]
 
-            # Parse batch
             new_count = 0
             for item in (sr if isinstance(sr, list) else []):
                 parsed = _parse_restaurant(item)
                 if parsed and parsed["id"] not in seen_ids:
                     seen_ids.add(parsed["id"])
-                    restaurants.append(parsed)
-                    new_count += 1
+                    # Only store if keyword-relevant (or no keyword)
+                    if _is_relevant(parsed, keyword):
+                        restaurants.append(parsed)
+                        new_count += 1
 
             has_more = meta.get("hasMore", False)
-            if new_count == 0 or not has_more:
+            if not has_more:
+                break
+            # If keyword active and this page had zero relevant hits, keep paging
+            # but stop after 8 pages to avoid infinite loops
+            if page >= 8:
                 break
 
             page += 1
 
+    print(f"[zomato] Final: {len(restaurants)} restaurants (keyword='{keyword}')")
     return restaurants[:max_results]
 
 
 async def fetch_zomato_menu(restaurant_id: str) -> list[dict]:
     """
     Fetch menu items for a Zomato restaurant.
-    Uses the restaurant's order page via getPage webroute.
     Returns list of {name, price, description, image, category}.
     """
     # TODO: implement menu scraping via getPage for individual restaurant
-    # For now returns empty list — restaurant listing is the MVP requirement
     return []
