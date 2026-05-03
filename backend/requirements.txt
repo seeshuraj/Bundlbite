@@ -1,12 +1,33 @@
+# Bundlbite Backend Dependencies
+# LLM: Qwen3 via Ollama (local) or Groq (cloud) — no Anthropic needed
+
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 httpx==0.27.2
 pydantic==2.9.2
+
+# LangChain core
 langchain==0.3.7
-langchain-anthropic==0.2.4
-langchain-openai==0.2.6
+langchain-core==0.3.19
 langgraph==0.2.50
+
+# Qwen3 via Ollama (local, free)
+langchain-ollama==0.2.1
+
+# Qwen3 via Groq (cloud, free tier, 800 tok/s)
+langchain-groq==0.2.1
+
+# OpenAI fallback (optional)
+langchain-openai==0.2.6
+
+# Scraper
 playwright==1.48.0
+
+# Cache
 redis==5.1.1
+
+# DB
 supabase==2.9.1
+
+# Utils
 python-dotenv==1.0.1
