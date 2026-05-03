@@ -1,21 +1,33 @@
 # scraper/swiggy.py
-# Swiggy scraper - uses SYNC Playwright in a ThreadPoolExecutor
-# This permanently bypasses the Windows asyncio ProactorEventLoop issue.
-# Playwright runs in its own thread with its own event loop.
+# Swiggy scraper - sync Playwright in ThreadPoolExecutor
+# Windows fix: set SelectorEventLoop inside the thread before sync_playwright
 
+import sys
 import json
 import asyncio
 import random
 from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright
 
-# Shared thread pool for Playwright (max 2 concurrent browsers)
 _executor = ThreadPoolExecutor(max_workers=2)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 ]
+
+
+def _set_windows_loop():
+    """
+    sync_playwright() internally calls asyncio.new_event_loop() inside the thread.
+    On Windows that creates a ProactorEventLoop which can't spawn subprocesses.
+    Setting the policy here — inside the thread — forces SelectorEventLoop.
+    Must be called as the FIRST line of any function that uses sync_playwright.
+    """
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
 
 def _stealth_args():
@@ -61,18 +73,14 @@ def _parse_cards(cards: list) -> list:
     return results
 
 
-# -------------------------------------------------------
-# SYNC Playwright function — runs in a thread
-# -------------------------------------------------------
 def _sync_fetch_restaurants(lat: float, lng: float, keyword: str) -> list:
-    """Sync Playwright scrape. Called from a thread pool."""
+    # MUST be first line — sets SelectorEventLoop in this thread
+    _set_windows_loop()
+
     intercepted = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=_stealth_args(),
-        )
+        browser = p.chromium.launch(headless=True, args=_stealth_args())
         context = browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             viewport={"width": 1366, "height": 768},
@@ -90,24 +98,20 @@ def _sync_fetch_restaurants(lat: float, lng: float, keyword: str) -> list:
         page = context.new_page()
         _apply_stealth(page)
 
-        # Intercept Swiggy dapi calls
         def handle_route(route):
             url = route.request.url
             if "/dapi/restaurants" in url:
                 try:
                     response = route.fetch()
-                    try:
-                        body = response.json()
-                        cards = (
-                            body.get("data", {}).get("cards") or
-                            body.get("data", {}).get("restaurants") or []
-                        )
-                        parsed = _parse_cards(cards)
-                        if parsed:
-                            intercepted.extend(parsed)
-                            print(f"[Swiggy] Intercepted {len(parsed)} restaurants")
-                    except Exception as e:
-                        print(f"[Swiggy] Parse error: {e}")
+                    body = response.json()
+                    cards = (
+                        body.get("data", {}).get("cards") or
+                        body.get("data", {}).get("restaurants") or []
+                    )
+                    parsed = _parse_cards(cards)
+                    if parsed:
+                        intercepted.extend(parsed)
+                        print(f"[Swiggy] Intercepted {len(parsed)} restaurants")
                     route.fulfill(response=response)
                 except Exception as e:
                     print(f"[Swiggy] Route error: {e}")
@@ -119,7 +123,6 @@ def _sync_fetch_restaurants(lat: float, lng: float, keyword: str) -> list:
 
         try:
             page.goto("https://www.swiggy.com/", wait_until="domcontentloaded", timeout=30000)
-            # Wait up to 12s for interception
             page.wait_for_timeout(12000)
         except Exception as e:
             print(f"[Swiggy] Navigation error: {e}")
@@ -148,7 +151,7 @@ def _sync_fetch_restaurants(lat: float, lng: float, keyword: str) -> list:
                     intercepted.extend(_parse_cards(cards))
                     print(f"[Swiggy] Fallback got {len(intercepted)} restaurants")
                 else:
-                    print(f"[Swiggy] Fallback error: {result}")
+                    print(f"[Swiggy] Fallback result: {result}")
             except Exception as e:
                 print(f"[Swiggy] Fallback exception: {e}")
 
@@ -159,7 +162,8 @@ def _sync_fetch_restaurants(lat: float, lng: float, keyword: str) -> list:
 
 
 def _sync_fetch_menu(restaurant_id: str, lat: float, lng: float) -> list:
-    """Sync Playwright menu scrape."""
+    _set_windows_loop()  # MUST be first line
+
     items = []
 
     with sync_playwright() as p:
@@ -178,28 +182,25 @@ def _sync_fetch_menu(restaurant_id: str, lat: float, lng: float) -> list:
             if "/dapi/menu" in route.request.url:
                 try:
                     response = route.fetch()
-                    try:
-                        body = response.json()
-                        for card in body.get("data", {}).get("cards", []):
-                            groups = (
-                                card.get("groupedCard", {})
-                                .get("cardGroupMap", {})
-                                .get("REGULAR", {})
-                                .get("cards", [])
-                            )
-                            for g in groups:
-                                for ic in g.get("card", {}).get("card", {}).get("itemCards", []):
-                                    info = ic.get("card", {}).get("info", {})
-                                    if info.get("name"):
-                                        items.append({
-                                            "id": info.get("id", ""),
-                                            "name": info.get("name", ""),
-                                            "price": (info.get("price") or 0) / 100,
-                                            "is_veg": info.get("itemAttribute", {}).get("vegClassifier") == "VEG",
-                                            "description": info.get("description", ""),
-                                        })
-                    except Exception:
-                        pass
+                    body = response.json()
+                    for card in body.get("data", {}).get("cards", []):
+                        groups = (
+                            card.get("groupedCard", {})
+                            .get("cardGroupMap", {})
+                            .get("REGULAR", {})
+                            .get("cards", [])
+                        )
+                        for g in groups:
+                            for ic in g.get("card", {}).get("card", {}).get("itemCards", []):
+                                info = ic.get("card", {}).get("info", {})
+                                if info.get("name"):
+                                    items.append({
+                                        "id": info.get("id", ""),
+                                        "name": info.get("name", ""),
+                                        "price": (info.get("price") or 0) / 100,
+                                        "is_veg": info.get("itemAttribute", {}).get("vegClassifier") == "VEG",
+                                        "description": info.get("description", ""),
+                                    })
                     route.fulfill(response=response)
                 except Exception:
                     route.continue_()
@@ -208,8 +209,11 @@ def _sync_fetch_menu(restaurant_id: str, lat: float, lng: float) -> list:
 
         page.route("**/*", handle_menu)
         try:
-            page.goto(f"https://www.swiggy.com/restaurants/r-{restaurant_id}",
-                      wait_until="domcontentloaded", timeout=25000)
+            page.goto(
+                f"https://www.swiggy.com/restaurants/r-{restaurant_id}",
+                wait_until="domcontentloaded",
+                timeout=25000,
+            )
             page.wait_for_timeout(10000)
         except Exception:
             pass
@@ -218,24 +222,11 @@ def _sync_fetch_menu(restaurant_id: str, lat: float, lng: float) -> list:
     return items
 
 
-# -------------------------------------------------------
-# Async wrappers — run sync Playwright in thread pool
-# -------------------------------------------------------
 async def fetch_swiggy_restaurants(lat: float, lng: float, keyword: str = "") -> list:
-    """Async wrapper: runs sync Playwright scrape in a thread."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        _executor,
-        _sync_fetch_restaurants,
-        lat, lng, keyword
-    )
+    return await loop.run_in_executor(_executor, _sync_fetch_restaurants, lat, lng, keyword)
 
 
 async def fetch_swiggy_menu(restaurant_id: str, lat: float, lng: float) -> list:
-    """Async wrapper: runs sync Playwright menu scrape in a thread."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        _executor,
-        _sync_fetch_menu,
-        restaurant_id, lat, lng
-    )
+    return await loop.run_in_executor(_executor, _sync_fetch_menu, restaurant_id, lat, lng)
