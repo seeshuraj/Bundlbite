@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bundlbite — Group Ordering MVP</title>
+  <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&f[]=cabinet-grotesk@500,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- SIDEBAR -->
+    <aside class="sidebar">
+      <div class="logo-row">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+              <path d="M5 8C5 6.34 6.34 5 8 5h8c1.66 0 3 1.34 3 3v2c0 1.66-1.34 3-3 3h-3l-3 4v-4H8c-1.66 0-3-1.34-3-3V8z" stroke="white" stroke-width="1.8" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <div>
+            <h1 class="brand-name">Bundlbite</h1>
+            <p class="brand-tagline">Group ordering copilot</p>
+          </div>
+        </div>
+        <button class="theme-toggle" data-theme-toggle aria-label="Switch theme">☾</button>
+      </div>
+
+      <section>
+        <p class="section-label">Workflow</p>
+        <nav class="nav-list">
+          <button class="nav-btn active">1. Collect group intent</button>
+          <button class="nav-btn">2. Compare Swiggy vs Zomato</button>
+          <button class="nav-btn">3. Optimise to budget</button>
+          <button class="nav-btn">4. Confirm order split</button>
+          <button class="nav-btn">5. Track delivery</button>
+        </nav>
+      </section>
+
+      <section>
+        <p class="section-label">Live group (5 members)</p>
+        <div class="member-list" id="memberList">
+          <div class="member-card"><span>Rahul · Biryani</span><span class="pill">₹260</span></div>
+          <div class="member-card"><span>Sneha · South Indian</span><span class="pill">₹190</span></div>
+          <div class="member-card"><span>Ajay · Burgers</span><span class="pill">₹220</span></div>
+          <div class="member-card"><span>Priya · Healthy bowl</span><span class="pill">₹240</span></div>
+          <div class="member-card"><span>Vikram · Momos</span><span class="pill">₹150</span></div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- MAIN -->
+    <main class="main">
+      <div class="topbar">
+        <div>
+          <p class="section-label">MVP — Phase 1</p>
+          <h2 class="page-title">Turn messy group orders into one<br>budget-safe checkout.</h2>
+        </div>
+        <div class="cta-row">
+          <button class="btn btn-secondary">Import previous group</button>
+          <button class="btn btn-primary" id="optimiseBtn">Run price optimisation</button>
+        </div>
+      </div>
+
+      <div class="workspace">
+        <!-- CHAT PANEL -->
+        <section class="panel chat-panel">
+          <div class="panel-header">
+            <div>
+              <h3>Conversation</h3>
+              <p class="muted">Natural language order collection with budget awareness.</p>
+            </div>
+            <span class="pill">AI + MCP routing</span>
+          </div>
+
+          <div class="chat-thread" id="chatThread">
+            <div class="bubble assistant">
+              <div>Hi! Tell me who's ordering, what they want, and your total budget — I'll handle the rest across Swiggy and Zomato.</div>
+              <span class="bubble-meta">Bundlbite AI · Just now</span>
+            </div>
+          </div>
+
+          <div class="composer">
+            <textarea id="chatInput" placeholder="Example: We are 5 people. Rahul wants chicken biryani, Sneha wants dosa, Ajay wants a burger, Priya wants a paneer bowl, Vikram wants momos. Budget is ₹1200."></textarea>
+            <div class="quick-actions">
+              <div class="chip-row">
+                <button class="micro-btn" onclick="fillExample(1)">Office lunch · 5 people</button>
+                <button class="micro-btn" onclick="fillExample(2)">Late night · 3 people</button>
+                <button class="micro-btn" onclick="fillExample(3)">Dietary filters</button>
+              </div>
+              <button class="btn btn-primary" id="sendBtn">Generate baskets →</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- RESULTS PANEL -->
+        <section class="panel results-panel" id="resultsPanel">
+          <div>
+            <p class="section-label">Optimisation snapshot</p>
+            <h3 class="panel-title">Best restaurant baskets</h3>
+          </div>
+
+          <div class="stat-grid">
+            <div class="stat-card"><span class="muted">Budget fit</span><strong id="statFit">—</strong><span class="muted">of ₹1,200</span></div>
+            <div class="stat-card"><span class="muted">Avg rating</span><strong id="statRating">—</strong><span class="muted">weighted</span></div>
+            <div class="stat-card"><span class="muted">ETA</span><strong id="statEta">—</strong><span class="muted">mins</span></div>
+          </div>
+
+          <div id="basketArea" class="basket-placeholder muted">Results will appear here after you describe your group order.</div>
+        </section>
+      </div>
+    </main>
+
+    <!-- RIGHT RAIL -->
+    <aside class="price-rail">
+      <section class="summary-card">
+        <div>
+          <p class="section-label">Order summary</p>
+          <h3 class="panel-title">Budget &amp; checkout</h3>
+        </div>
+        <div class="summary-total">
+          <span class="muted">Recommended total</span>
+          <strong id="totalPrice">₹—</strong>
+          <p class="muted" id="savingNote">Awaiting basket selection.</p>
+        </div>
+        <div>
+          <div class="progress-label"><span>Budget usage</span><strong id="budgetPct">—</strong></div>
+          <div class="progress"><span id="progressBar" style="width:0%"></span></div>
+        </div>
+        <button class="btn btn-primary" id="placeOrderBtn" disabled>Place order via provider</button>
+      </section>
+
+      <section class="summary-card">
+        <p class="section-label">Order tracking</p>
+        <div class="track-item">
+          <div class="dot-line"><span class="dot" id="t1"></span><span>Basket approved by all members.</span></div>
+          <div class="dot-line"><span class="dot" id="t2"></span><span>Provider selected &amp; payment split.</span></div>
+          <div class="dot-line"><span class="dot" id="t3"></span><span>Restaurant accepted order.</span></div>
+          <div class="dot-line"><span class="dot" id="t4"></span><span>Delivery partner assigned.</span></div>
+          <div class="dot-line"><span class="dot" id="t5"></span><span>Order delivered.</span></div>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
