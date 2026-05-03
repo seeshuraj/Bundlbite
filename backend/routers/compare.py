@@ -8,7 +8,6 @@ merges and returns a unified list sorted by rating.
 
 import asyncio
 from fastapi import APIRouter, Query
-from typing import Optional
 
 # Scrapers live at project root /scraper/
 from scraper.zomato import fetch_zomato_restaurants
@@ -17,7 +16,7 @@ from scraper.zomato import fetch_zomato_restaurants
 try:
     from scraper.swiggy import fetch_swiggy_restaurants
 except ImportError:
-    async def fetch_swiggy_restaurants(lat, lng, keyword="", max_results=40):
+    async def fetch_swiggy_restaurants(lat, lng, **kwargs):
         return []
 
 router = APIRouter()
