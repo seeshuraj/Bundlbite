@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  # Redis cache (local dev)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+
+  # Scraper microservice
+  scraper:
+    build:
+      context: .
+      dockerfile: scraper/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    command: uvicorn scraper.main:app --host 0.0.0.0 --port 8001 --reload
+
+  # Main FastAPI backend
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SCRAPER_URL=http://scraper:8001
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+    depends_on:
+      - redis
+      - scraper
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
