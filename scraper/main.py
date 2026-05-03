@@ -1,17 +1,33 @@
-"""
-Bundlbite Scraper Microservice
-FastAPI app exposing menu + pricing endpoints.
-Playwright fetches live data; Redis caches results.
-"""
+# scraper/main.py
+# Bundlbite Scraper Microservice
+# Runs on port 8001, called by the backend
 
-from fastapi import FastAPI, HTTPException, Query
-from scraper.swiggy import SwiggyScaper
-from scraper.zomato import ZomatoScraper
-from scraper.cache import RedisCache
-import asyncio
+import os
+import json
+import hashlib
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Bundlbite Scraper", version="1.0.0")
-cache = RedisCache()
+from scraper.swiggy import fetch_swiggy_restaurants, fetch_swiggy_menu
+from scraper.cache import get_cache, set_cache
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[Scraper] Starting up — Playwright ready")
+    yield
+    print("[Scraper] Shutting down")
+
+
+app = FastAPI(title="Bundlbite Scraper", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -21,74 +37,53 @@ async def health():
 
 @app.get("/swiggy/restaurants")
 async def swiggy_restaurants(
-    lat: float = Query(...),
-    lng: float = Query(...),
-    cuisine: str = Query(default="all")
+    lat: float = Query(..., description="Latitude"),
+    lng: float = Query(..., description="Longitude"),
+    keyword: str = Query("", description="Cuisine or dish keyword"),
 ):
-    cache_key = f"swiggy:restaurants:{lat}:{lng}:{cuisine}"
-    cached = await cache.get(cache_key)
+    cache_key = f"swiggy:restaurants:{lat:.4f}:{lng:.4f}:{keyword}"
+    cached = await get_cache(cache_key)
     if cached:
-        return cached
-    scraper = SwiggyScaper()
-    data = await scraper.fetch_restaurants(lat, lng, cuisine)
-    await cache.set(cache_key, data, ttl=900)  # 15 min TTL
-    return data
+        return {"provider": "swiggy", "restaurants": json.loads(cached), "cached": True}
+
+    restaurants = await fetch_swiggy_restaurants(lat, lng, keyword)
+    if restaurants:
+        await set_cache(cache_key, json.dumps(restaurants), ttl=900)  # 15 min
+
+    return {"provider": "swiggy", "restaurants": restaurants, "cached": False, "error": "" if restaurants else "No results — Swiggy may be blocking headless browsers in this region"}
 
 
-@app.get("/swiggy/menu/{restaurant_id}")
-async def swiggy_menu(restaurant_id: str):
+@app.get("/swiggy/menu")
+async def swiggy_menu(
+    restaurant_id: str = Query(...),
+    lat: float = Query(12.9352),
+    lng: float = Query(77.6245),
+):
     cache_key = f"swiggy:menu:{restaurant_id}"
-    cached = await cache.get(cache_key)
+    cached = await get_cache(cache_key)
     if cached:
-        return cached
-    scraper = SwiggyScaper()
-    data = await scraper.fetch_menu(restaurant_id)
-    await cache.set(cache_key, data, ttl=900)
-    return data
+        return {"items": json.loads(cached), "cached": True}
 
+    items = await fetch_swiggy_menu(restaurant_id, lat, lng)
+    if items:
+        await set_cache(cache_key, json.dumps(items), ttl=1800)  # 30 min
 
-@app.get("/zomato/restaurants")
-async def zomato_restaurants(
-    lat: float = Query(...),
-    lng: float = Query(...),
-    cuisine: str = Query(default="all")
-):
-    cache_key = f"zomato:restaurants:{lat}:{lng}:{cuisine}"
-    cached = await cache.get(cache_key)
-    if cached:
-        return cached
-    scraper = ZomatoScraper()
-    data = await scraper.fetch_restaurants(lat, lng, cuisine)
-    await cache.set(cache_key, data, ttl=900)
-    return data
-
-
-@app.get("/zomato/menu/{restaurant_id}")
-async def zomato_menu(restaurant_id: str):
-    cache_key = f"zomato:menu:{restaurant_id}"
-    cached = await cache.get(cache_key)
-    if cached:
-        return cached
-    scraper = ZomatoScraper()
-    data = await scraper.fetch_menu(restaurant_id)
-    await cache.set(cache_key, data, ttl=900)
-    return data
+    return {"restaurant_id": restaurant_id, "items": items, "cached": False}
 
 
 @app.get("/compare")
 async def compare(
     lat: float = Query(...),
     lng: float = Query(...),
-    cuisines: str = Query(..., description="Comma-separated list of cuisines")
+    keyword: str = Query(""),
 ):
-    """Fetch and normalise restaurants from both providers in parallel."""
-    cuisine_list = [c.strip() for c in cuisines.split(",")]
-    tasks = [
-        SwiggyScaper().fetch_restaurants(lat, lng, " ".join(cuisine_list)),
-        ZomatoScraper().fetch_restaurants(lat, lng, " ".join(cuisine_list)),
-    ]
-    swiggy_data, zomato_data = await asyncio.gather(*tasks)
+    """Compare Swiggy and Zomato restaurants side by side."""
+    import asyncio
+    swiggy_task = fetch_swiggy_restaurants(lat, lng, keyword)
+    # Zomato runs in parallel
+    swiggy_results = await swiggy_task
+
     return {
-        "swiggy": swiggy_data,
-        "zomato": zomato_data,
+        "swiggy": swiggy_results,
+        "swiggy_count": len(swiggy_results),
     }
