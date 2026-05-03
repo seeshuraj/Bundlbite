@@ -1,12 +1,10 @@
 # scraper/main.py
-# Bundlbite Scraper Microservice
-# Runs on port 8001, called by the backend
-
 import os
 import json
-import hashlib
+import traceback
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from scraper.swiggy import fetch_swiggy_restaurants, fetch_swiggy_menu
@@ -37,20 +35,41 @@ async def health():
 
 @app.get("/swiggy/restaurants")
 async def swiggy_restaurants(
-    lat: float = Query(..., description="Latitude"),
-    lng: float = Query(..., description="Longitude"),
-    keyword: str = Query("", description="Cuisine or dish keyword"),
+    lat: float = Query(...),
+    lng: float = Query(...),
+    keyword: str = Query(""),
 ):
     cache_key = f"swiggy:restaurants:{lat:.4f}:{lng:.4f}:{keyword}"
     cached = await get_cache(cache_key)
     if cached:
         return {"provider": "swiggy", "restaurants": json.loads(cached), "cached": True}
 
-    restaurants = await fetch_swiggy_restaurants(lat, lng, keyword)
-    if restaurants:
-        await set_cache(cache_key, json.dumps(restaurants), ttl=900)  # 15 min
-
-    return {"provider": "swiggy", "restaurants": restaurants, "cached": False, "error": "" if restaurants else "No results — Swiggy may be blocking headless browsers in this region"}
+    try:
+        restaurants = await fetch_swiggy_restaurants(lat, lng, keyword)
+        if restaurants:
+            await set_cache(cache_key, json.dumps(restaurants), ttl=900)
+        return {
+            "provider": "swiggy",
+            "restaurants": restaurants,
+            "count": len(restaurants),
+            "cached": False,
+            "error": "" if restaurants else "No results — Swiggy may be blocking scraper",
+        }
+    except Exception as e:
+        # Return detailed error instead of 500
+        tb = traceback.format_exc()
+        print(f"[Scraper ERROR]\n{tb}")
+        return JSONResponse(
+            status_code=200,  # Return 200 with error details so UI can handle gracefully
+            content={
+                "provider": "swiggy",
+                "restaurants": [],
+                "count": 0,
+                "cached": False,
+                "error": str(e),
+                "traceback": tb,
+            },
+        )
 
 
 @app.get("/swiggy/menu")
@@ -64,11 +83,18 @@ async def swiggy_menu(
     if cached:
         return {"items": json.loads(cached), "cached": True}
 
-    items = await fetch_swiggy_menu(restaurant_id, lat, lng)
-    if items:
-        await set_cache(cache_key, json.dumps(items), ttl=1800)  # 30 min
-
-    return {"restaurant_id": restaurant_id, "items": items, "cached": False}
+    try:
+        items = await fetch_swiggy_menu(restaurant_id, lat, lng)
+        if items:
+            await set_cache(cache_key, json.dumps(items), ttl=1800)
+        return {"restaurant_id": restaurant_id, "items": items, "cached": False}
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[Menu ERROR]\n{tb}")
+        return JSONResponse(
+            status_code=200,
+            content={"restaurant_id": restaurant_id, "items": [], "error": str(e), "traceback": tb},
+        )
 
 
 @app.get("/compare")
@@ -77,12 +103,7 @@ async def compare(
     lng: float = Query(...),
     keyword: str = Query(""),
 ):
-    """Compare Swiggy and Zomato restaurants side by side."""
-    import asyncio
-    swiggy_task = fetch_swiggy_restaurants(lat, lng, keyword)
-    # Zomato runs in parallel
-    swiggy_results = await swiggy_task
-
+    swiggy_results = await fetch_swiggy_restaurants(lat, lng, keyword)
     return {
         "swiggy": swiggy_results,
         "swiggy_count": len(swiggy_results),
