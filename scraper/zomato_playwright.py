@@ -14,22 +14,14 @@ LAT  = 12.9352
 LNG  = 77.6245
 TARGET_URL = "https://www.zomato.com/bangalore/delivery"
 
-# Keywords that appear in the real restaurant-listing XHR URLs
-REST_URL_HINTS = [
-    "getPage",
-    "search",
-    "delivery",
-    "listing",
-    "restaurant",
-    "feed",
-]
+REST_URL_HINTS = ["getPage", "search", "delivery", "listing", "restaurant", "feed"]
 
 captured = []
 
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)  # set True to hide browser
+        browser = await p.chromium.launch(headless=False)
         context = await browser.new_context(
             locale="en-IN",
             timezone_id="Asia/Kolkata",
@@ -41,7 +33,6 @@ async def main():
 
         page = await context.new_page()
 
-        # Intercept all JSON responses
         async def handle_response(response):
             url = response.url
             ct  = response.headers.get("content-type", "")
@@ -54,10 +45,7 @@ async def main():
             except Exception:
                 return
 
-            # Check if this response contains restaurant items
-            sections = (
-                body.get("page_data", {}).get("sections", {})
-            )
+            sections = body.get("page_data", {}).get("sections", {})
             if isinstance(sections, dict):
                 sr = sections.get("SECTION_SEARCH_RESULT", [])
                 for sec in sr:
@@ -75,7 +63,6 @@ async def main():
                         print(f"  Saved -> {fname}")
                         return
 
-            # Also capture any non-getPage JSON with restaurant keys
             if any(k in body for k in ["restaurants", "search_results", "results"]):
                 print(f"[XHR] Possible alt endpoint: {url}")
                 print(f"  keys: {list(body.keys())[:8]}")
@@ -90,13 +77,11 @@ async def main():
         print(f"[1] Navigating to {TARGET_URL}")
         await page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
 
-        # Allow JS to trigger lazy-loaded restaurant sections
         print("[2] Scrolling to trigger lazy loads...")
         for _ in range(5):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
             await asyncio.sleep(1.5)
 
-        # Wait a bit more for any deferred XHR
         await asyncio.sleep(3)
 
         print(f"\n[3] Captured {len(captured)} restaurant XHR responses.")
@@ -105,9 +90,7 @@ async def main():
             for c in captured:
                 print(f"  {c['url'][:120]}")
         else:
-            print("[!] No restaurant XHRs captured.")
-            print("    Try manually scrolling the browser window that opened.")
-            print("    Waiting 15s for manual interaction...")
+            print("[!] No restaurant XHRs captured. Waiting 15s for manual interaction...")
             await asyncio.sleep(15)
             print(f"    Captured after wait: {len(captured)}")
 
@@ -116,6 +99,12 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Windows requires ProactorEventLoop for subprocess (Playwright) support
+    # Do NOT use WindowsSelectorEventLoopPolicy here — it blocks subprocess creation
     if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main())
+    else:
+        asyncio.run(main())
