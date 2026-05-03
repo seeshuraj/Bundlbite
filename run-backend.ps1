@@ -1,17 +1,12 @@
-# Start Bundlbite Backend (PowerShell)
-# Run from project root: .\run-backend.ps1
-
+# Start Bundlbite Backend (PowerShell — Windows safe)
 Write-Host "Starting Bundlbite Backend on http://localhost:8000" -ForegroundColor Cyan
 
-# Activate venv if exists
 if (Test-Path ".\venv\Scripts\Activate.ps1") {
     .\venv\Scripts\Activate.ps1
 }
 
-# Load .env manually (uvicorn reads it via python-dotenv)
-$envFile = ".env"
-if (Test-Path $envFile) {
-    Get-Content $envFile | ForEach-Object {
+if (Test-Path ".env") {
+    Get-Content ".env" | ForEach-Object {
         if ($_ -match "^([^#=]+)=(.*)$") {
             [System.Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim(), "Process")
         }
@@ -19,4 +14,4 @@ if (Test-Path $envFile) {
     Write-Host ".env loaded" -ForegroundColor Green
 }
 
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+python run_backend.py
