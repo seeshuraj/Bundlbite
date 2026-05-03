@@ -1,24 +1,18 @@
 # Bundlbite Backend Dependencies
-# LLM: Qwen3 via Ollama (local) or Groq (cloud) — no Anthropic needed
+# LLM: Qwen3-Coder-480B via NVIDIA NIM (OpenAI-compatible)
 
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 httpx==0.27.2
 pydantic==2.9.2
 
-# LangChain core
+# OpenAI SDK — used for NVIDIA NIM endpoint
+openai==1.54.4
+
+# LangChain (budget engine + future chains)
 langchain==0.3.7
 langchain-core==0.3.19
 langgraph==0.2.50
-
-# Qwen3 via Ollama (local, free)
-langchain-ollama==0.2.1
-
-# Qwen3 via Groq (cloud, free tier, 800 tok/s)
-langchain-groq==0.2.1
-
-# OpenAI fallback (optional)
-langchain-openai==0.2.6
 
 # Scraper
 playwright==1.48.0

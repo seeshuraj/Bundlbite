@@ -1,133 +1,107 @@
 """
 Bundlbite LangGraph Agent
-LLM: Qwen3 via Ollama (local) with Groq cloud fallback.
-No Anthropic or OpenAI dependency.
+LLM: Qwen3-Coder-480B via NVIDIA NIM (OpenAI-compatible endpoint).
+Streaming SSE responses to frontend.
 """
 
 import os
 import json
 from typing import AsyncGenerator
-from langchain_core.messages import HumanMessage, SystemMessage
+from openai import AsyncOpenAI
 
 
-def _get_llm():
+def _get_nvidia_client() -> AsyncOpenAI:
     """
-    LLM priority:
-    1. Ollama local (Qwen3) — zero cost, best for dev
-    2. Groq API (Qwen3) — free tier, 800 tok/s, best for prod
-    3. OpenAI GPT-4o — fallback if both unavailable
+    Returns an async OpenAI client pointed at NVIDIA NIM.
+    Uses NVIDIA_API_KEY from environment.
     """
-    # Option 1: Ollama local
-    ollama_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    try:
-        from langchain_ollama import ChatOllama
-        model_name = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-        llm = ChatOllama(
-            model=model_name,
-            base_url=ollama_base,
-            temperature=0,
-            format="json",  # Force JSON output mode
+    api_key = os.getenv("NVIDIA_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "NVIDIA_API_KEY not set. Get yours free at https://build.nvidia.com"
         )
-        # Quick connectivity check
-        import httpx
-        resp = httpx.get(f"{ollama_base}/api/tags", timeout=2)
-        if resp.status_code == 200:
-            print(f"[BundlbiteAgent] Using Ollama Qwen3 @ {ollama_base}")
-            return llm
-    except Exception as e:
-        print(f"[BundlbiteAgent] Ollama unavailable: {e}")
-
-    # Option 2: Groq (hosts Qwen3, free tier)
-    groq_key = os.getenv("GROQ_API_KEY")
-    if groq_key:
-        try:
-            from langchain_groq import ChatGroq
-            model_name = os.getenv("GROQ_MODEL", "qwen-qwq-32b")  # Qwen3 on Groq
-            llm = ChatGroq(
-                model=model_name,
-                temperature=0,
-                api_key=groq_key,
-            )
-            print(f"[BundlbiteAgent] Using Groq Qwen3: {model_name}")
-            return llm
-        except Exception as e:
-            print(f"[BundlbiteAgent] Groq unavailable: {e}")
-
-    # Option 3: OpenAI fallback
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if openai_key:
-        from langchain_openai import ChatOpenAI
-        print("[BundlbiteAgent] Falling back to OpenAI GPT-4o")
-        return ChatOpenAI(model="gpt-4o", temperature=0, api_key=openai_key)
-
-    raise RuntimeError(
-        "No LLM configured. Set OLLAMA_BASE_URL, GROQ_API_KEY, or OPENAI_API_KEY."
+    return AsyncOpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=api_key,
     )
 
 
+MODEL = os.getenv("NVIDIA_MODEL", "qwen/qwen3-coder-480b-a35b-instruct")
+
 SYSTEM_PROMPT = """
 You are Bundlbite, an AI group food ordering assistant for India.
-Your job:
-1. Parse the group order message — extract each person's name, cuisine preference, and dish keywords.
-2. Extract the total group budget in INR.
-3. Extract the delivery location if mentioned.
-4. Return a structured JSON with: members[], total_budget, location.
+Your ONLY job is to parse group order messages and return structured JSON.
 
-Always reply with ONLY valid JSON. No markdown, no explanation — just the JSON object.
-Handle Hinglish naturally:
-  - "Rahul ko biryani chahiye" → Rahul wants biryani
-  - "Priya veg hai" → Priya is vegetarian
-  - "budget 1200 hai" → total_budget: 1200
+Rules:
+- Reply with ONLY valid JSON. No markdown, no explanation, no code fences.
+- Handle English, Hindi, and Hinglish naturally.
+- If a field is unknown, use null.
+- Extract: member names, cuisine/dish preferences, veg/non-veg flag, budget in INR, location.
 
-Example output:
+Hinglish examples:
+  "Rahul ko biryani chahiye"     → Rahul wants biryani
+  "Priya veg hai"                → Priya is vegetarian
+  "budget 1200 hai"              → total_budget: 1200
+  "Koramangala mein order karo" → location: Koramangala
+
+Output schema:
 {
   "members": [
-    {"name": "Rahul", "cuisine": "Biryani", "dish_keywords": ["chicken biryani"], "budget_share": null, "is_veg": false},
-    {"name": "Priya", "cuisine": "South Indian", "dish_keywords": ["dosa", "idli"], "budget_share": null, "is_veg": true}
+    {
+      "name": "string",
+      "cuisine": "string",
+      "dish_keywords": ["string"],
+      "is_veg": true | false | null,
+      "budget_share": number | null
+    }
   ],
-  "total_budget": 1200,
-  "location": "Indiranagar, Bangalore"
+  "total_budget": number | null,
+  "location": "string | null"
 }
 """
 
 
 class BundlbiteAgent:
     def __init__(self):
-        self.llm = _get_llm()
+        self.client = _get_nvidia_client()
 
     async def parse_intent(self, message: str) -> dict:
         """
-        Use Qwen3 to extract structured order intent from natural language / Hinglish.
+        Use Qwen3-480B to extract structured order intent from
+        natural language / Hinglish group order text.
         """
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=message),
-        ]
         try:
-            response = await self.llm.ainvoke(messages)
-            content = response.content
+            response = await self.client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": message},
+                ],
+                temperature=0.2,   # Low temp for deterministic JSON
+                top_p=0.8,
+                max_tokens=1024,
+                stream=False,
+            )
+            content = response.choices[0].message.content or ""
 
             # Strip markdown code fences if model adds them
             if "```" in content:
-                parts = content.split("```")
-                for part in parts:
-                    part = part.strip()
-                    if part.startswith("json"):
-                        part = part[4:]
+                for part in content.split("```"):
+                    part = part.strip().lstrip("json").strip()
                     try:
-                        return json.loads(part.strip())
+                        return json.loads(part)
                     except Exception:
                         continue
 
             return json.loads(content.strip())
+
         except json.JSONDecodeError:
-            # Fallback: return raw content for debugging
             return {
                 "members": [],
                 "total_budget": None,
                 "location": None,
-                "raw": response.content,
                 "error": "JSON parse failed",
+                "raw": content,
             }
         except Exception as e:
             return {
@@ -139,28 +113,67 @@ class BundlbiteAgent:
 
     async def stream(self, message: str, session_id: str, location: dict) -> AsyncGenerator:
         """
-        Stream agent steps back to the client as SSE events.
-        Steps: parsing → parsed → fetching → complete
+        Stream agent steps as SSE events to the frontend.
+        Uses Qwen3-480B streaming for the parse step.
         """
-        yield {"step": "parsing", "message": "Parsing your group order with Qwen3..."}
+        yield {"step": "parsing", "message": "Parsing your group order with Qwen3-480B..."}
 
-        parsed = await self.parse_intent(message)
+        # ---- Streaming parse (shows token-by-token to user) ----
+        full_content = ""
+        try:
+            stream = await self.client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": message},
+                ],
+                temperature=0.2,
+                top_p=0.8,
+                max_tokens=1024,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    full_content += delta
+                    yield {"step": "token", "delta": delta}  # stream tokens to UI
+        except Exception as e:
+            yield {"step": "error", "message": f"LLM error: {e}"}
+            return
+
+        # ---- Parse the accumulated JSON ----
+        parsed = {}
+        try:
+            content = full_content.strip()
+            if "```" in content:
+                for part in content.split("```"):
+                    part = part.strip().lstrip("json").strip()
+                    try:
+                        parsed = json.loads(part)
+                        break
+                    except Exception:
+                        continue
+            else:
+                parsed = json.loads(content)
+        except Exception:
+            parsed = {"members": [], "total_budget": None, "location": None, "raw": full_content}
+
         yield {"step": "parsed", "data": parsed}
 
-        if not parsed.get("members"):
+        members = parsed.get("members", [])
+        total = parsed.get("total_budget") or 0
+
+        if not members:
             yield {
                 "step": "error",
                 "message": (
                     "Could not parse the group order. "
-                    "Try: 'Rahul wants biryani, Sneha wants dosa, budget 1200, Koramangala'"
+                    "Try: 'Rahul wants biryani, Sneha wants dosa, budget \u20b91200, Koramangala'"
                 ),
             }
             return
 
-        members = parsed.get("members", [])
-        total = parsed.get("total_budget") or 0
         per_person = round(total / len(members), 2) if members and total else 0
-
         yield {"step": "fetching", "message": f"Comparing Swiggy & Zomato for {len(members)} people..."}
 
         yield {
@@ -168,7 +181,7 @@ class BundlbiteAgent:
             "message": (
                 f"Parsed {len(members)} members. "
                 f"Budget: \u20b9{total} (\u20b9{per_person}/person). "
-                "Fetching best baskets from Swiggy and Zomato..."
+                "Fetching best baskets..."
             ),
             "data": parsed,
         }
