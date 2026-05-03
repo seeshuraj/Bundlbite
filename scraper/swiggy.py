@@ -1,232 +1,217 @@
 # scraper/swiggy.py
-# Swiggy scraper - sync Playwright in ThreadPoolExecutor
-# Windows fix: set SelectorEventLoop inside the thread before sync_playwright
+# Swiggy scraper using httpx - direct API calls, no browser needed
+# Faster, more reliable, zero asyncio/Playwright issues on Windows
 
-import sys
-import json
+import httpx
 import asyncio
-import random
-from concurrent.futures import ThreadPoolExecutor
-from playwright.sync_api import sync_playwright
+from typing import Optional
 
-_executor = ThreadPoolExecutor(max_workers=2)
+# Swiggy internal API base
+SWIGGY_BASE = "https://www.swiggy.com"
+SWIGGY_API  = "https://www.swiggy.com/dapi"
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-]
-
-
-def _set_windows_loop():
-    """
-    sync_playwright() internally calls asyncio.new_event_loop() inside the thread.
-    On Windows that creates a ProactorEventLoop which can't spawn subprocesses.
-    Setting the policy here — inside the thread — forces SelectorEventLoop.
-    Must be called as the FIRST line of any function that uses sync_playwright.
-    """
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-
-def _stealth_args():
-    return [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-        "--no-sandbox",
-        "--window-size=1366,768",
-        "--disable-gpu",
-        "--lang=en-IN",
-    ]
+# Headers that mimic a real Chrome browser session
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.swiggy.com/",
+    "Origin": "https://www.swiggy.com",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "Connection": "keep-alive",
+    "Content-Type": "application/json",
+}
 
 
-def _apply_stealth(page):
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-IN','en-US','en','hi'] });
-        window.chrome = { runtime: {} };
-    """)
-
-
-def _parse_cards(cards: list) -> list:
+def _parse_restaurant_cards(cards: list) -> list:
+    """Extract restaurant info from Swiggy dapi card format."""
     results = []
-    for r in cards:
+    for card in cards:
+        # Card format varies - try both structures
         info = (
-            r.get("card", {}).get("card", {}).get("info") or
-            r.get("data") or {}
+            card.get("card", {}).get("card", {}).get("info")
+            or card.get("data")
+            or {}
         )
         name = info.get("name")
         if not name:
             continue
         results.append({
-            "id": info.get("id", ""),
+            "id": str(info.get("id", "")),
             "name": name,
             "cuisines": info.get("cuisines", []),
-            "rating": str(info.get("avgRatingString") or info.get("avgRating") or "0"),
+            "rating": str(
+                info.get("avgRatingString")
+                or info.get("avgRating")
+                or "0"
+            ),
             "delivery_time": info.get("sla", {}).get("deliveryTime", 30),
-            "price_for_two": info.get("costForTwo") or info.get("costForTwoMessage") or "₹300 for two",
+            "price_for_two": (
+                info.get("costForTwo")
+                or info.get("costForTwoMessage")
+                or "\u20b9300 for two"
+            ),
             "image": info.get("cloudinaryImageId", ""),
             "source": "swiggy",
         })
     return results
 
 
-def _sync_fetch_restaurants(lat: float, lng: float, keyword: str) -> list:
-    # MUST be first line — sets SelectorEventLoop in this thread
-    _set_windows_loop()
+async def _get_session_cookies(client: httpx.AsyncClient) -> dict:
+    """Hit Swiggy homepage to get session cookies."""
+    try:
+        r = await client.get(SWIGGY_BASE, timeout=15)
+        return dict(r.cookies)
+    except Exception as e:
+        print(f"[Swiggy] Cookie fetch error: {e}")
+        return {}
 
-    intercepted = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=_stealth_args())
-        context = browser.new_context(
-            user_agent=random.choice(USER_AGENTS),
-            viewport={"width": 1366, "height": 768},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-            geolocation={"latitude": lat, "longitude": lng},
-            permissions=["geolocation"],
-            extra_http_headers={
-                "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
-                "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-            },
-        )
-        page = context.new_page()
-        _apply_stealth(page)
+async def fetch_swiggy_restaurants(
+    lat: float, lng: float, keyword: str = ""
+) -> list:
+    """
+    Fetch restaurants from Swiggy using direct httpx API calls.
+    Uses a persistent async client with session cookies.
+    """
+    url = (
+        f"{SWIGGY_API}/restaurants/list/v5"
+        f"?lat={lat}&lng={lng}"
+        f"&is-seo-homepage-enabled=true"
+        f"&page_type=DESKTOP_WEB_LISTING"
+    )
 
-        def handle_route(route):
-            url = route.request.url
-            if "/dapi/restaurants" in url:
-                try:
-                    response = route.fetch()
-                    body = response.json()
-                    cards = (
-                        body.get("data", {}).get("cards") or
-                        body.get("data", {}).get("restaurants") or []
-                    )
-                    parsed = _parse_cards(cards)
-                    if parsed:
-                        intercepted.extend(parsed)
-                        print(f"[Swiggy] Intercepted {len(parsed)} restaurants")
-                    route.fulfill(response=response)
-                except Exception as e:
-                    print(f"[Swiggy] Route error: {e}")
-                    route.continue_()
-            else:
-                route.continue_()
+    async with httpx.AsyncClient(
+        headers=BASE_HEADERS,
+        follow_redirects=True,
+        timeout=30,
+    ) as client:
+        # Step 1: get session cookies from homepage
+        cookies = await _get_session_cookies(client)
+        print(f"[Swiggy] Got {len(cookies)} session cookies")
 
-        page.route("**/*", handle_route)
-
+        # Step 2: hit the restaurant list API
         try:
-            page.goto("https://www.swiggy.com/", wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(12000)
+            r = await client.get(url, cookies=cookies)
+            print(f"[Swiggy] API status: {r.status_code}")
+
+            if r.status_code != 200:
+                print(f"[Swiggy] Non-200 response: {r.text[:300]}")
+                return []
+
+            data = r.json()
+
+            # Navigate the nested card structure
+            all_cards = data.get("data", {}).get("cards", [])
+            restaurants = []
+
+            for top_card in all_cards:
+                # Cards can be nested several levels deep
+                inner = top_card.get("card", {}).get("card", {})
+                card_type = inner.get("@type", "")
+
+                # Restaurant grid cards
+                if "gridWidget" in card_type or "restaurantListWidget" in card_type:
+                    grid_elements = inner.get("gridElements", {}).get("infoWithStyle", {}).get("restaurants", [])
+                    restaurants.extend(_parse_restaurant_cards(grid_elements))
+
+                # Direct restaurant cards
+                if inner.get("info", {}).get("name"):
+                    restaurants.extend(_parse_restaurant_cards([top_card]))
+
+                # Check nested data key
+                nested = top_card.get("card", {}).get("card", {}).get("data", {})
+                if nested.get("name"):
+                    restaurants.extend(_parse_restaurant_cards([{"data": nested}]))
+
+            # Filter by keyword if provided
+            if keyword and restaurants:
+                kw = keyword.lower()
+                filtered = [
+                    r for r in restaurants
+                    if kw in r["name"].lower()
+                    or any(kw in c.lower() for c in r.get("cuisines", []))
+                ]
+                if filtered:
+                    restaurants = filtered
+
+            # Deduplicate by id
+            seen = set()
+            unique = []
+            for r in restaurants:
+                if r["id"] not in seen:
+                    seen.add(r["id"])
+                    unique.append(r)
+
+            print(f"[Swiggy] Total unique restaurants: {len(unique)}")
+            return unique
+
+        except httpx.HTTPError as e:
+            print(f"[Swiggy] HTTP error: {e}")
+            return []
         except Exception as e:
-            print(f"[Swiggy] Navigation error: {e}")
-
-        # Fallback: in-page fetch with session cookies
-        if not intercepted:
-            try:
-                api_url = (
-                    f"https://www.swiggy.com/dapi/restaurants/list/v5"
-                    f"?lat={lat}&lng={lng}&is-seo-homepage-enabled=true"
-                    f"&page_type=DESKTOP_WEB_LISTING"
-                )
-                result = page.evaluate(f"""
-                    async () => {{
-                        try {{
-                            const r = await fetch('{api_url}', {{
-                                credentials: 'include',
-                                headers: {{ 'Content-Type': 'application/json' }}
-                            }});
-                            return await r.json();
-                        }} catch(e) {{ return {{ error: e.toString() }}; }}
-                    }}
-                """)
-                if result and not result.get("error"):
-                    cards = result.get("data", {}).get("cards", [])
-                    intercepted.extend(_parse_cards(cards))
-                    print(f"[Swiggy] Fallback got {len(intercepted)} restaurants")
-                else:
-                    print(f"[Swiggy] Fallback result: {result}")
-            except Exception as e:
-                print(f"[Swiggy] Fallback exception: {e}")
-
-        browser.close()
-
-    print(f"[Swiggy] Total: {len(intercepted)} restaurants")
-    return intercepted
+            print(f"[Swiggy] Unexpected error: {e}")
+            import traceback; traceback.print_exc()
+            return []
 
 
-def _sync_fetch_menu(restaurant_id: str, lat: float, lng: float) -> list:
-    _set_windows_loop()  # MUST be first line
+async def fetch_swiggy_menu(
+    restaurant_id: str, lat: float, lng: float
+) -> list:
+    """Fetch menu items for a specific restaurant."""
+    url = (
+        f"{SWIGGY_API}/menu/pl"
+        f"?page-type=REGULAR_MENU&complete-menu=true"
+        f"&lat={lat}&lng={lng}"
+        f"&restaurantId={restaurant_id}"
+        f"&catalog_qa=undefined&submitAction=ENTER"
+    )
 
-    items = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=_stealth_args())
-        context = browser.new_context(
-            user_agent=random.choice(USER_AGENTS),
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-            geolocation={"latitude": lat, "longitude": lng},
-            permissions=["geolocation"],
-        )
-        page = context.new_page()
-        _apply_stealth(page)
-
-        def handle_menu(route):
-            if "/dapi/menu" in route.request.url:
-                try:
-                    response = route.fetch()
-                    body = response.json()
-                    for card in body.get("data", {}).get("cards", []):
-                        groups = (
-                            card.get("groupedCard", {})
-                            .get("cardGroupMap", {})
-                            .get("REGULAR", {})
-                            .get("cards", [])
-                        )
-                        for g in groups:
-                            for ic in g.get("card", {}).get("card", {}).get("itemCards", []):
-                                info = ic.get("card", {}).get("info", {})
-                                if info.get("name"):
-                                    items.append({
-                                        "id": info.get("id", ""),
-                                        "name": info.get("name", ""),
-                                        "price": (info.get("price") or 0) / 100,
-                                        "is_veg": info.get("itemAttribute", {}).get("vegClassifier") == "VEG",
-                                        "description": info.get("description", ""),
-                                    })
-                    route.fulfill(response=response)
-                except Exception:
-                    route.continue_()
-            else:
-                route.continue_()
-
-        page.route("**/*", handle_menu)
+    async with httpx.AsyncClient(
+        headers=BASE_HEADERS,
+        follow_redirects=True,
+        timeout=30,
+    ) as client:
+        cookies = await _get_session_cookies(client)
         try:
-            page.goto(
-                f"https://www.swiggy.com/restaurants/r-{restaurant_id}",
-                wait_until="domcontentloaded",
-                timeout=25000,
-            )
-            page.wait_for_timeout(10000)
-        except Exception:
-            pass
+            r = await client.get(url, cookies=cookies)
+            if r.status_code != 200:
+                return []
 
-        browser.close()
-    return items
+            data = r.json()
+            items = []
 
+            for top_card in data.get("data", {}).get("cards", []):
+                groups = (
+                    top_card.get("groupedCard", {})
+                    .get("cardGroupMap", {})
+                    .get("REGULAR", {})
+                    .get("cards", [])
+                )
+                for g in groups:
+                    for ic in g.get("card", {}).get("card", {}).get("itemCards", []):
+                        info = ic.get("card", {}).get("info", {})
+                        if info.get("name"):
+                            items.append({
+                                "id": str(info.get("id", "")),
+                                "name": info.get("name", ""),
+                                "price": (info.get("price") or 0) / 100,
+                                "is_veg": (
+                                    info.get("itemAttribute", {})
+                                    .get("vegClassifier") == "VEG"
+                                ),
+                                "description": info.get("description", ""),
+                                "image": info.get("imageId", ""),
+                            })
+            print(f"[Swiggy Menu] {len(items)} items for restaurant {restaurant_id}")
+            return items
 
-async def fetch_swiggy_restaurants(lat: float, lng: float, keyword: str = "") -> list:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_executor, _sync_fetch_restaurants, lat, lng, keyword)
-
-
-async def fetch_swiggy_menu(restaurant_id: str, lat: float, lng: float) -> list:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_executor, _sync_fetch_menu, restaurant_id, lat, lng)
+        except Exception as e:
+            print(f"[Swiggy Menu] Error: {e}")
+            return []
